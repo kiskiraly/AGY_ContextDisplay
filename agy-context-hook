@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""
+agy-context-hook — CLI-Style Context Window & Token Telemetry for Antigravity 2.0
+=================================================================================
+
+Brings the Antigravity CLI `/context` visual breakdown (`⛁` System/Customizations,
+`◉` User/Agent/Tools, `□` Free space, `⊠` Checkpoints) into the Antigravity 2.0
+Chat UI via a lightweight `PreInvocation` lifecycle hook, plus an interactive
+terminal inspector (`agy-context-hook --panel`).
+
+Reference:
+  https://antigravity.google/docs/cli/commands/context/
+  https://antigravity.google/docs/hooks
+
+Privacy & Security Design:
+  - 100% local execution using only the Python 3 standard library.
+  - Zero network requests, zero telemetry, and zero external dependencies.
+  - Reads only token counters and message byte lengths from the local
+    `transcript.jsonl` file; never echoes prompt text, file paths, or secrets.
+
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Default context window capacity (1,000,000 tokens for Gemini / Argon 1M models).
+# Can be overridden via the AGY_CONTEXT_WINDOW environment variable.
+WINDOW_LIMIT = int(os.environ.get("AGY_CONTEXT_WINDOW", "1000000"))
+
+# Approximate characters per token used only for splitting the server-reported
+# total input_tokens across categories (System vs. User vs. Agent vs. Tools).
+CHARS_PER_TOKEN = 4.0
+
+
+def fmt_tokens(n: int, signed: bool = False) -> str:
+    """Format a token count compactly (e.g., 14200 -> '14.2k', 1000000 -> '1.0M')."""
+    sign = ""
+    if signed:
+        sign = "+" if n >= 0 else "-"
+    v = abs(int(n))
+    if v >= 1_000_000:
+        formatted = f"{v / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{sign}{formatted}M"
+    if v >= 1_000:
+        return f"{sign}{v / 1_000:.1f}k"
+    return f"{sign}{v}"
+
+
+def status_icon_and_tip(context_tokens: int, window_limit: int = WINDOW_LIMIT) -> Tuple[str, str]:
+    """
+    Return a traffic-light status indicator and optional compaction hint
+    based on context window utilization percentage.
+    """
+    ratio = context_tokens / max(1, window_limit)
+    if ratio < 0.25:
+        return "🟢", ""
+    if ratio < 0.50:
+        return "🟡", ""
+    if ratio < 0.75:
+        return "🟠", " · 💡 Consider /compact"
+    return "🔴", " · ⚠️ High context — run /compact"
+
+
+def build_cli_bar(
+    sys_tokens: int,
+    conv_tokens: int,
+    window_limit: int = WINDOW_LIMIT,
+    width: int = 10,
+) -> str:
+    """
+    Build a proportional 10-cell progress bar using the Antigravity CLI `/context`
+    glyph vocabulary:
+      ⛁ : System prompt, system tools, rules, skills, and MCP schemas
+      ◉ : Active conversation (User messages, Agent responses, Tool calls)
+      □ : Free context capacity remaining
+    """
+    total = max(0, sys_tokens + conv_tokens)
+    if total <= 0:
+        return "□" * width
+
+    ratio = min(1.0, max(0.0, total / max(1, window_limit)))
+    filled = round(ratio * width)
+    if filled == 0 and total >= int(window_limit * 0.015):
+        filled = 1
+    filled = min(width, max(0, filled))
+
+    if filled == 0:
+        return "□" * width
+
+    # Split filled cells between System (⛁) and Conversation/Tools (◉).
+    if filled == 1:
+        # With a single active cell, show ⛁ on the initial system-heavy turn,
+        # and ◉ once conversation/tool tokens dominate.
+        sys_cells = 1 if sys_tokens >= conv_tokens else 0
+        conv_cells = 1 - sys_cells
+    else:
+        sys_share = sys_tokens / max(1, total)
+        sys_cells = round(filled * sys_share)
+        if sys_tokens > 0 and sys_cells == 0:
+            sys_cells = 1
+        if conv_tokens > 0 and sys_cells >= filled:
+            sys_cells = filled - 1
+        conv_cells = filled - sys_cells
+
+    free_cells = max(0, width - sys_cells - conv_cells)
+    return ("⛁" * sys_cells) + ("◉" * conv_cells) + ("□" * free_cells)
+
+
+def parse_transcript(transcript_path: Optional[Path]) -> List[Dict[str, Any]]:
+    """Safely parse a JSONL transcript file into a list of step dictionaries."""
+    if not transcript_path or not transcript_path.exists():
+        return []
+    steps: List[Dict[str, Any]] = []
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    steps.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return steps
+
+
+def analyze_context(steps: List[Dict[str, Any]], window_limit: int = WINDOW_LIMIT) -> Dict[str, Any]:
+    """
+    Derive CLI `/context` metrics from the server-logged steps in `transcript.jsonl`.
+
+    Returns a dictionary containing:
+      - context_tokens: Total tokens in the active window (input + cache_read)
+      - free_tokens:    Remaining capacity in the window
+      - delta_tokens:   Net context change compared to the previous turn
+      - cache_pct:      Prompt cache hit percentage
+      - sys_tokens:     Estimated tokens used by System prompt, tools, rules & MCP
+      - user_tokens:    Estimated tokens used by User messages
+      - agent_tokens:   Estimated tokens used by Agent responses & reasoning
+      - tool_tokens:    Estimated tokens used by Tool calls & command outputs
+      - checkpoints:    Number of context compaction checkpoints detected
+    """
+    planners_with_pos = [
+        (i, s) for i, s in enumerate(steps) if s.get("type") == "PLANNER_RESPONSE"
+    ]
+
+    if not planners_with_pos:
+        default_sys = 14_000
+        return {
+            "has_data": False,
+            "context_tokens": default_sys,
+            "free_tokens": max(0, window_limit - default_sys),
+            "delta_tokens": default_sys,
+            "cache_pct": 0,
+            "window_pct": (default_sys / max(1, window_limit)) * 100,
+            "sys_tokens": default_sys,
+            "user_tokens": 0,
+            "agent_tokens": 0,
+            "tool_tokens": 0,
+            "checkpoints": 0,
+        }
+
+    last_pos, last_planner = planners_with_pos[-1]
+
+    # Identify turn boundaries from USER_INPUT steps so Δ measures either:
+    # - Current in-progress turn growth (after tool calls have executed), or
+    # - Most recently completed turn growth (at the start of a new user turn).
+    user_indices = [i for i, s in enumerate(steps) if s.get("type") == "USER_INPUT"]
+    if not user_indices:
+        turn_start = 0
+    elif last_pos > user_indices[-1]:
+        turn_start = user_indices[-1]
+    elif len(user_indices) >= 2:
+        turn_start = user_indices[-2]
+    else:
+        turn_start = 0
+
+    prior_planners = [s for i, s in planners_with_pos if i <= turn_start]
+
+    input_tok = int(last_planner.get("input_tokens") or 0)
+    cache_tok = int(last_planner.get("cache_read_tokens") or 0)
+    context_tokens = input_tok + cache_tok
+
+    if prior_planners:
+        prev_last = prior_planners[-1]
+        prev_context = int(prev_last.get("input_tokens") or 0) + int(
+            prev_last.get("cache_read_tokens") or 0
+        )
+    else:
+        prev_context = 0
+
+    delta_tokens = context_tokens - prev_context
+    cache_pct = round((cache_tok / context_tokens) * 100) if context_tokens > 0 else 0
+    window_pct = (context_tokens / max(1, window_limit)) * 100
+    free_tokens = max(0, window_limit - context_tokens)
+
+    # 1. Estimate baseline System & Customizations overhead (⛁) from the first model call.
+    first_pos, first_planner = planners_with_pos[0]
+    first_total = int(first_planner.get("input_tokens") or 0) + int(
+        first_planner.get("cache_read_tokens") or 0
+    )
+    first_user_and_ephemeral_chars = 0
+    for s in steps[:first_pos]:
+        stype = s.get("type")
+        if stype in ("USER_INPUT", "EPHEMERAL_MESSAGE"):
+            first_user_and_ephemeral_chars += len(str(s.get("content") or ""))
+
+    est_first_msg_tokens = int(first_user_and_ephemeral_chars / CHARS_PER_TOKEN)
+    sys_tokens = max(2_000, first_total - est_first_msg_tokens)
+    sys_tokens = min(sys_tokens, context_tokens)
+
+    # 2. Proportionally attribute remaining active tokens across User, Agent, and Tools (◉).
+    remaining_tokens = max(0, context_tokens - sys_tokens)
+
+    user_chars = 0
+    tool_chars = 0
+    raw_agent_tokens = 0
+    checkpoints = 0
+
+    # Detect compaction checkpoints via significant context drops (>30k tokens) between steps.
+    prev_step_ctx = 0
+    for idx, s in enumerate(steps[: last_pos + 1]):
+        stype = s.get("type")
+        content_str = str(s.get("content") or "")
+
+        if stype == "USER_INPUT":
+            if "<CONTEXT_SUMMARY>" in content_str:
+                checkpoints += 1
+            user_chars += len(content_str)
+        elif stype == "PLANNER_RESPONSE":
+            step_ctx = int(s.get("input_tokens") or 0) + int(s.get("cache_read_tokens") or 0)
+            if prev_step_ctx > 0 and (prev_step_ctx - step_ctx) > 30_000:
+                checkpoints += 1
+            prev_step_ctx = step_ctx
+
+            out_tok = int(s.get("output_tokens") or 0)
+            if out_tok > 0:
+                raw_agent_tokens += out_tok
+            else:
+                raw_agent_tokens += int(
+                    (len(content_str) + len(str(s.get("thinking") or ""))) / CHARS_PER_TOKEN
+                )
+            # Count tool call request payloads under Tool calls.
+            if s.get("tool_calls"):
+                tool_chars += len(json.dumps(s.get("tool_calls")))
+        elif stype in ("GENERIC", "SYSTEM_MESSAGE"):
+            tool_chars += len(content_str)
+
+    raw_user_tokens = max(1, int(user_chars / CHARS_PER_TOKEN))
+    raw_tool_tokens = int(tool_chars / CHARS_PER_TOKEN)
+    raw_conv_total = max(1, raw_user_tokens + raw_agent_tokens + raw_tool_tokens)
+
+    user_tokens = round(remaining_tokens * (raw_user_tokens / raw_conv_total))
+    agent_tokens = round(remaining_tokens * (raw_agent_tokens / raw_conv_total))
+    tool_tokens = max(0, remaining_tokens - user_tokens - agent_tokens)
+
+    return {
+        "has_data": True,
+        "context_tokens": context_tokens,
+        "free_tokens": free_tokens,
+        "delta_tokens": delta_tokens,
+        "cache_pct": cache_pct,
+        "window_pct": window_pct,
+        "sys_tokens": sys_tokens,
+        "user_tokens": user_tokens,
+        "agent_tokens": agent_tokens,
+        "tool_tokens": tool_tokens,
+        "checkpoints": checkpoints,
+    }
+
+
+def format_badge(metrics: Dict[str, Any], window_limit: int = WINDOW_LIMIT) -> str:
+    """
+    Format the single-line chat badge using the Antigravity CLI `/context` icons:
+      ⛁ System/Customizations · ◉ User/Agent/Tools · □ Free · ⊠ Checkpoints
+    """
+    ctx = metrics["context_tokens"]
+    sys_tok = metrics["sys_tokens"]
+    user_tok = metrics["user_tokens"]
+    agent_tok = metrics["agent_tokens"]
+    tool_tok = metrics["tool_tokens"]
+    conv_tok = user_tok + agent_tok + tool_tok
+
+    icon, tip = status_icon_and_tip(ctx, window_limit)
+    bar = build_cli_bar(sys_tok, conv_tok, window_limit=window_limit, width=10)
+    win_str = fmt_tokens(window_limit)
+
+    if not metrics["has_data"]:
+        return (
+            f"`{icon} {bar} ~{fmt_tokens(ctx)} / {win_str} ({metrics['window_pct']:.1f}%) "
+            f"· ⛁ Sys ~{fmt_tokens(sys_tok)} · □ Free {fmt_tokens(metrics['free_tokens'])} "
+            f"· ⚡ 0% cached`"
+        )
+
+    parts = [
+        f"{icon} {bar} {fmt_tokens(ctx)} / {win_str} ({metrics['window_pct']:.1f}%)",
+        f"⛁ Sys {fmt_tokens(sys_tok)}",
+        f"◉ Msg {fmt_tokens(user_tok + agent_tok)}",
+        f"◉ Tools {fmt_tokens(tool_tok)}",
+        f"Δ {fmt_tokens(metrics['delta_tokens'], signed=True)}",
+        f"⚡ {metrics['cache_pct']}% cached",
+    ]
+    if metrics["checkpoints"] > 0:
+        cp_word = "checkpoint" if metrics["checkpoints"] == 1 else "checkpoints"
+        parts.append(f"⊠ {metrics['checkpoints']} {cp_word}")
+
+    return "`" + " · ".join(parts) + f"{tip}`"
+
+
+def render_cli_panel(metrics: Dict[str, Any], window_limit: int = WINDOW_LIMIT) -> str:
+    """
+    Render a multi-line terminal panel modeled after the Antigravity CLI `/context`
+    command (https://antigravity.google/docs/cli/commands/context/), pairing a
+    10x10 proportional cell grid on the left with a category breakdown on the right.
+    """
+    total_cells = 100
+    ctx = metrics["context_tokens"]
+    sys_tok = metrics["sys_tokens"]
+    conv_tok = metrics["user_tokens"] + metrics["agent_tokens"] + metrics["tool_tokens"]
+
+    bar_100 = build_cli_bar(sys_tok, conv_tok, window_limit=window_limit, width=total_cells)
+    grid_rows = [" ".join(bar_100[i : i + 10]) for i in range(0, total_cells, 10)]
+
+    icon, tip = status_icon_and_tip(ctx, window_limit)
+    pct = lambda n: f"{(n / max(1, window_limit)) * 100:5.1f}%"
+
+    summary_rows = [
+        f"{icon} Context Usage: {fmt_tokens(ctx)} / {fmt_tokens(window_limit)} ({metrics['window_pct']:.1f}%)",
+        "─" * 48,
+        f"⛁ System & customizations : {fmt_tokens(sys_tok):>7} ({pct(sys_tok)})",
+        f"◉ User messages           : {fmt_tokens(metrics['user_tokens']):>7} ({pct(metrics['user_tokens'])})",
+        f"◉ Agent responses         : {fmt_tokens(metrics['agent_tokens']):>7} ({pct(metrics['agent_tokens'])})",
+        f"◉ Tool calls              : {fmt_tokens(metrics['tool_tokens']):>7} ({pct(metrics['tool_tokens'])})",
+        f"□ Free space              : {fmt_tokens(metrics['free_tokens']):>7} ({pct(metrics['free_tokens'])})",
+        "─" * 48,
+        f"Δ Last turn growth        : {fmt_tokens(metrics['delta_tokens'], signed=True):>7}",
+        f"⚡ Prompt cache hit rate   : {metrics['cache_pct']:>6}%",
+    ]
+    if metrics["checkpoints"] > 0:
+        summary_rows.append(f"⊠ Compaction checkpoints  : {metrics['checkpoints']:>7}")
+    if tip:
+        summary_rows.append(tip.lstrip(" ·"))
+
+    lines = ["", "  Antigravity Context Usage (/context)", ""]
+    max_rows = max(len(grid_rows), len(summary_rows))
+    for idx in range(max_rows):
+        left = grid_rows[idx] if idx < len(grid_rows) else " " * 19
+        right = summary_rows[idx] if idx < len(summary_rows) else ""
+        lines.append(f"  {left}    {right}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def find_latest_transcript() -> Optional[Path]:
+    """Locate the most recently modified Antigravity `transcript.jsonl` for CLI `--panel` mode."""
+    pattern = str(
+        Path.home()
+        / ".gemini"
+        / "antigravity"
+        / "brain"
+        / "*"
+        / ".system_generated"
+        / "logs"
+        / "transcript.jsonl"
+    )
+    candidates = [Path(p) for p in glob.glob(pattern)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def is_context_slash_command(steps: List[Dict[str, Any]]) -> bool:
+    """
+    Return True if the latest USER_INPUT step is a `/context` command
+    (e.g., `/context` or `/context panel`), allowing zero-tool in-chat rendering
+    of the full 10x10 CLI `/context` grid.
+    """
+    user_steps = [s for s in steps if s.get("type") == "USER_INPUT"]
+    if not user_steps:
+        return False
+    content = str(user_steps[-1].get("content") or "")
+    if "<USER_REQUEST>" in content and "</USER_REQUEST>" in content:
+        content = content.split("<USER_REQUEST>", 1)[1].split("</USER_REQUEST>", 1)[0]
+    cleaned = content.strip().lower()
+    return cleaned in ("/context", "/context panel", "/context --panel", "context panel")
+
+
+def emit(payload: Dict[str, Any]) -> None:
+    """Write a JSON hook response to stdout."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Antigravity CLI-style context window badge hook and terminal inspector."
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default="pre",
+        help="Hook lifecycle stage ('pre' for PreInvocation). Ignored when --panel is set.",
+    )
+    parser.add_argument(
+        "-p",
+        "--panel",
+        action="store_true",
+        help="Render the interactive CLI `/context` 10x10 grid and category breakdown to stdout.",
+    )
+    parser.add_argument(
+        "-t",
+        "--transcript",
+        type=str,
+        default="",
+        help="Optional path to a specific transcript.jsonl file (defaults to latest active session).",
+    )
+    args = parser.parse_args()
+
+    # Terminal `/context` panel mode (either explicit `--panel` or interactive TTY without stdin pipe).
+    if args.panel or (sys.stdin.isatty() and args.mode == "pre" and len(sys.argv) == 1):
+        transcript_path = (
+            Path(args.transcript).expanduser() if args.transcript else find_latest_transcript()
+        )
+        steps = parse_transcript(transcript_path)
+        metrics = analyze_context(steps, window_limit=WINDOW_LIMIT)
+        print(render_cli_panel(metrics, window_limit=WINDOW_LIMIT))
+        return
+
+    # Hook execution mode (`PreInvocation` via hooks.json).
+    try:
+        raw_in = sys.stdin.read().strip()
+        hook_input = json.loads(raw_in) if raw_in else {}
+    except Exception:
+        hook_input = {}
+
+    if args.mode.lower() != "pre":
+        emit({})
+        return
+
+    transcript_str = args.transcript or hook_input.get("transcriptPath") or ""
+    transcript_path = Path(transcript_str).expanduser() if transcript_str else None
+    steps = parse_transcript(transcript_path)
+    metrics = analyze_context(steps, window_limit=WINDOW_LIMIT)
+    badge = format_badge(metrics, window_limit=WINDOW_LIMIT)
+
+    if is_context_slash_command(steps):
+        panel = render_cli_panel(metrics, window_limit=WINDOW_LIMIT).strip("\n")
+        msg = (
+            "<context_status_badge>\n"
+            "The user invoked `/context`. Respond ONLY with the following pre-computed "
+            "Antigravity CLI `/context` usage panel inside a ```text code block (do not call "
+            "any tools or recalculate any numbers), followed by the single-line badge on the last line:\n"
+            f"```text\n{panel}\n```\n\n"
+            f"{badge}\n"
+            "</context_status_badge>"
+        )
+    else:
+        msg = (
+            "<context_status_badge>\n"
+            "MANDATORY UI FOOTER: At the very end of your final response to the user this turn, "
+            "append a blank line followed by this exact single-line context status badge verbatim "
+            "(do not modify or recalculate the numbers):\n"
+            f"{badge}\n"
+            "</context_status_badge>"
+        )
+    emit({"injectSteps": [{"ephemeralMessage": msg}]})
+
+
+if __name__ == "__main__":
+    main()

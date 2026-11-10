@@ -1,0 +1,11 @@
+{
+  "context-status-hook": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ~/.local/bin/agy-context-hook pre || echo {}",
+        "timeout": 4
+      }
+    ]
+  }
+}
