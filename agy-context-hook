@@ -361,18 +361,14 @@ def render_cli_panel(metrics: Dict[str, Any], window_limit: int = WINDOW_LIMIT) 
 
 
 def find_latest_transcript() -> Optional[Path]:
-    """Locate the most recently modified Antigravity `transcript.jsonl` for CLI `--panel` mode."""
-    pattern = str(
-        Path.home()
-        / ".gemini"
-        / "antigravity"
-        / "brain"
-        / "*"
-        / ".system_generated"
-        / "logs"
-        / "transcript.jsonl"
-    )
-    candidates = [Path(p) for p in glob.glob(pattern)]
+    """Locate the most recently modified Antigravity `transcript.jsonl` across App, CLI, and IDE."""
+    gemini_dir = Path.home() / ".gemini"
+    candidates: List[Path] = []
+    for surface in ("antigravity", "antigravity-cli", "antigravity-ide"):
+        pattern = str(
+            gemini_dir / surface / "brain" / "**" / ".system_generated" / "logs" / "transcript.jsonl"
+        )
+        candidates.extend(Path(p) for p in glob.glob(pattern, recursive=True))
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
