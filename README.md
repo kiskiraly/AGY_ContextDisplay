@@ -78,20 +78,9 @@ Send `/context` in chat (zero tool calls) or run `agy-context-hook --panel` in y
 
 ---
 
-## 🖥️ Supported Surfaces & Cloud / Remote Limitations
+## ⚠️ Limitations
 
-| Surface | `<app_data_dir>` | Status | Notes |
-| :--- | :--- | :---: | :--- |
-| **Antigravity App (Desktop)** | `~/.gemini/antigravity` | ✅ Supported | Full live badge + `/context` panel |
-| **Antigravity IDE** | `~/.gemini/antigravity-ide` | ✅ Supported | Full live badge + `/context` panel |
-| **Antigravity CLI (`agy`) & [Remote Control](https://antigravity.google/docs/remote-control/)** | `~/.gemini/antigravity-cli` | ✅ Supported | Works locally and on self-hosted Linux servers/VMs via Remote Control |
-| **Google-Managed [Remote Agents](https://antigravity.google/docs/remote-agents/) (`jetski` Cloud VMs)** | `/shared/user/.gemini/jetski` | ❌ Unsupported | Blocked by cloud container isolation (see below) |
-
-### Why Google-Managed Remote Agents (`jetski` Cloud VMs) Aren't Supported
-Empirically tested inside Google's managed Debian 12 Remote Agent VMs (`jetski_remote_agents_3p`):
-1. **External Control Plane (`hooks.json` Not Evaluated):** In Google-managed Remote Agents, the `PreInvocation` / `PostToolUse` loop executes inside Google's cloud orchestrator outside the tool-execution VM. Lifecycle hooks in `~/.gemini/config/hooks.json` and `.agents/hooks.json` are never invoked on turn boundaries (`Lifecycle hooks` are currently scoped to App, CLI, and IDE only).
-2. **No Container-Side `transcript.jsonl`:** While Google mounts `.system_generated/tasks/` and artifacts into `/shared/user/.gemini/jetski/brain/...`, `.system_generated/logs/transcript.jsonl` (`input_tokens`, `cache_read_tokens`, `output_tokens`) is retained server-side and is not accessible from inside the VM.
-3. **Workaround:** To inspect exact context telemetry on a Google-managed Remote Agent thread, attach from a terminal with `agy --remote-agent -c` (or `--conversation=<id>`) and run the built-in CLI `/context` command — or run remote sessions on your own workstation/server using **[Remote Control](https://antigravity.google/docs/remote-control/)**, where `hooks.json` and `transcript.jsonl` execute locally.
+- **Antigravity Remote Projects are not supported:** On Google-managed Remote Agent cloud VMs, the orchestration loop and `transcript.jsonl` live outside the VM container, so local `hooks.json` scripts are never triggered and have no transcript file to read. (Works normally on local **Desktop App**, **IDE**, **CLI**, and self-hosted **[Remote Control](https://antigravity.google/docs/remote-control/)** sessions.)
 
 ---
 
