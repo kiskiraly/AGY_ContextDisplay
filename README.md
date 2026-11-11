@@ -1,4 +1,4 @@
-# AGY_CoontextDisplay (`agy-context-hook`)
+# AGY_ContextDisplay (`agy-context-hook`)
 
 > **100% vibecoded with Gemini inside Google Antigravity.**
 
