@@ -1,0 +1,11 @@
+{
+  "context-status-hook": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python \"%USERPROFILE%\\.gemini\\hooks\\agy-context-hook.py\" pre || echo {}",
+        "timeout": 4
+      }
+    ]
+  }
+}
