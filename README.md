@@ -50,7 +50,32 @@ Send `/context` in chat (zero tool calls) or run `agy-context-hook --panel` in y
 
 ---
 
-## 🚀 Quick Install
+## 🚀 Quick Install (Windows, macOS & Linux)
+
+### Option 1: Automatic Cross-Platform Installer (Recommended)
+
+Run [`install.py`](install.py) with Python 3.7+:
+
+```bash
+# macOS / Linux
+python3 install.py
+
+# Windows (cmd / PowerShell)
+python install.py
+# or: py -3 install.py
+```
+
+The installer automatically:
+- Copies the hook script to `~/.gemini/hooks/agy-context-hook.py` (`%USERPROFILE%\.gemini\hooks\agy-context-hook.py` on Windows) and, on macOS/Linux, also installs `~/.local/bin/agy-context-hook`.
+- Installs the `/context` skill to `~/.gemini/config/skills/context/SKILL.md`.
+- Safely merges `context-status-hook` into `~/.gemini/config/hooks.json` using the **exact Python interpreter path** and **resolved absolute script path** (so it works even if `~` or `python3` isn't supported in `cmd.exe`).
+
+*(Supports `--dry-run` to preview changes and `--uninstall` to remove.)*
+
+### Option 2: Manual Install
+
+<details>
+<summary>macOS / Linux manual steps</summary>
 
 1. **Install the hook & optional `/context` skill:**
    ```bash
@@ -74,7 +99,38 @@ Send `/context` in chat (zero tool calls) or run `agy-context-hook --panel` in y
      }
    }
    ```
-   *(Set `AGY_CONTEXT_WINDOW=200000` if using a model with a non-`1M` context window.)*
+
+</details>
+
+<details>
+<summary>Windows manual steps (PowerShell / cmd.exe)</summary>
+
+1. **Install the hook & optional `/context` skill (PowerShell):**
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.gemini\hooks", "$env:USERPROFILE\.gemini\config\skills\context" | Out-Null
+   Copy-Item .\agy-context-hook "$env:USERPROFILE\.gemini\hooks\agy-context-hook.py"
+   Copy-Item .\skills\context\SKILL.md "$env:USERPROFILE\.gemini\config\skills\context\SKILL.md"
+   ```
+
+2. **Add to `%USERPROFILE%\.gemini\config\hooks.json` (see [`hooks.windows.example.json`](hooks.windows.example.json)):**
+   ```json
+   {
+     "context-status-hook": {
+       "PreInvocation": [
+         {
+           "type": "command",
+           "command": "python \"%USERPROFILE%\\.gemini\\hooks\\agy-context-hook.py\" pre || echo {}",
+           "timeout": 4
+         }
+       ]
+     }
+   }
+   ```
+   *(Use `py -3` instead of `python` if `python` isn't on your `PATH`, and avoid `python3` on Windows as it often triggers the Microsoft Store stub.)*
+
+</details>
+
+*(Set `AGY_CONTEXT_WINDOW=200000` if using a model with a non-`1M` context window.)*
 
 ---
 
