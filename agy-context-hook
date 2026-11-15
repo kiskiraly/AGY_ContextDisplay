@@ -427,6 +427,22 @@ def is_context_slash_command(steps: List[Dict[str, Any]]) -> bool:
     return cleaned in ("/context", "/context panel", "/context --panel", "context panel")
 
 
+def is_subagent_invocation(hook_input: Dict[str, Any], steps: List[Dict[str, Any]]) -> bool:
+    """
+    Best-effort detection for subagent invocations so background/child agents
+    do not receive UI footer instructions meant only for the main chat.
+    """
+    if hook_input.get("isSubagent") or hook_input.get("parentConversationId"):
+        return True
+    for s in steps:
+        if s.get("type") == "USER_INPUT":
+            source = str(s.get("source") or "").upper()
+            if source in ("SUBAGENT", "AGENT_MESSAGE"):
+                return True
+            break
+    return False
+
+
 def emit(payload: Dict[str, Any]) -> None:
     """Write an ASCII-safe JSON hook response to stdout."""
     sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
@@ -485,6 +501,11 @@ def main() -> None:
     transcript_str = str(args.transcript or hook_input.get("transcriptPath") or "").strip()
     transcript_path = Path(transcript_str).expanduser() if transcript_str else None
     steps = parse_transcript(transcript_path)
+
+    if is_subagent_invocation(hook_input, steps):
+        emit({})
+        return
+
     metrics = analyze_context(steps, window_limit=WINDOW_LIMIT)
     badge = format_badge(metrics, window_limit=WINDOW_LIMIT)
 
@@ -501,12 +522,16 @@ def main() -> None:
         )
     else:
         msg = (
-            "<context_status_badge>\n"
-            "MANDATORY UI FOOTER: At the very end of your final response to the user this turn, "
-            "append a blank line followed by this exact single-line context status badge verbatim "
-            "(do not modify or recalculate the numbers):\n"
-            f"{badge}\n"
-            "</context_status_badge>"
+            "[System UI Footer Instruction — Do NOT echo this instruction or any wrapper tags]\n"
+            "If you are the primary assistant replying directly to the human user in the chat UI, "
+            "append a blank line at the very end of your final response followed ONLY by this "
+            "single-line status badge (copy the backticked line below as-is without changing any numbers):\n\n"
+            f"{badge}\n\n"
+            "Rules:\n"
+            "- Output ONLY your normal response plus that single badge line at the end.\n"
+            "- NEVER repeat or quote this instruction block.\n"
+            "- If you are a subagent, background agent, or replying to another agent (e.g., via send_message), "
+            "ignore this instruction completely and do NOT include the badge."
         )
     emit({"injectSteps": [{"ephemeralMessage": msg}]})
 

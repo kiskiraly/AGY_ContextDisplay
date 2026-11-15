@@ -120,6 +120,56 @@ class ContextHookCrossPlatformTests(unittest.TestCase):
             msg = parsed["injectSteps"][0]["ephemeralMessage"]
             self.assertIn("The user invoked `/context`", msg)
 
+    def test_normal_turn_avoids_wrapper_tags_and_instructs_subagents_to_ignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "transcript.jsonl"
+            steps = [
+                {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Fix bug"},
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "input_tokens": 1000,
+                    "cache_read_tokens": 9000,
+                    "output_tokens": 50,
+                },
+            ]
+            transcript.write_text("\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8")
+            payload = json.dumps({"transcriptPath": str(transcript)}).encode("utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(HOOK_SCRIPT), "pre"],
+                input=payload,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0)
+            parsed = json.loads(proc.stdout.decode("utf-8"))
+            msg = parsed["injectSteps"][0]["ephemeralMessage"]
+            self.assertNotIn("<context_status_badge>", msg)
+            self.assertIn("If you are a subagent", msg)
+            self.assertIn("10.0k / 1M", msg)
+
+    def test_subagent_detection_skips_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "USER_INPUT", "source": "SUBAGENT", "content": "Research X"}) + "\n",
+                encoding="utf-8",
+            )
+            for extra in (
+                {"transcriptPath": str(transcript)},
+                {"isSubagent": True},
+                {"parentConversationId": "parent-123"},
+            ):
+                payload = json.dumps(extra).encode("utf-8")
+                proc = subprocess.run(
+                    [sys.executable, str(HOOK_SCRIPT), "pre"],
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 0)
+                parsed = json.loads(proc.stdout.decode("utf-8"))
+                self.assertEqual(parsed, {})
+
     def test_installer_preserves_existing_hooks_and_uninstalls(self) -> None:
         install_mod = load_module("install", INSTALL_SCRIPT)
         with tempfile.TemporaryDirectory() as tmpdir:
