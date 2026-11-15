@@ -42,9 +42,11 @@ def configure_stdio() -> None:
 def build_hook_command(python_exe: str, script_path: Path) -> str:
     """Build a shell-safe `PreInvocation` command for the current OS."""
     if os.name == "nt":
-        cmd = subprocess.list2cmdline([python_exe, str(script_path), "pre"])
+        # Prefix with `call ` so `cmd.exe /c` never strips outer quotes when both
+        # python_exe (e.g. C:\Program Files\...) and script_path contain spaces.
+        cmd = f"call {subprocess.list2cmdline([str(python_exe), str(script_path), 'pre'])}"
     else:
-        cmd = f"{shlex.quote(python_exe)} {shlex.quote(str(script_path))} pre"
+        cmd = f"{shlex.quote(str(python_exe))} {shlex.quote(str(script_path))} pre"
     return f"{cmd} || echo {{}}"
 
 

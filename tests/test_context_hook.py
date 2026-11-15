@@ -162,9 +162,53 @@ class ContextHookCrossPlatformTests(unittest.TestCase):
                 r"C:\Program Files\Python312\python.exe",
                 PureWindowsPath(r"C:\Users\Alice Smith\.gemini\hooks\agy-context-hook.py"),
             )
+        self.assertTrue(cmd.startswith('call "C:\\Program Files\\Python312\\python.exe"'))
         self.assertIn('"C:\\Program Files\\Python312\\python.exe"', cmd)
         self.assertTrue(cmd.endswith("pre || echo {}"))
         self.assertNotIn("~", cmd)
+
+    @unittest.skipUnless(os.name == "nt", "Windows cmd.exe /c quoting test")
+    def test_windows_cmd_c_spaced_paths_execution(self) -> None:
+        install_mod = load_module("install", INSTALL_SCRIPT)
+        with tempfile.TemporaryDirectory(prefix="agy space ") as tmpdir:
+            root = Path(tmpdir)
+            py_dir = root / "Program Files Python"
+            py_dir.mkdir()
+            py_wrapper = py_dir / "python wrap.cmd"
+            py_wrapper.write_text(f'@"{sys.executable}" %*\r\n', encoding="utf-8")
+
+            hook_dir = root / "Alice Smith" / ".gemini" / "hooks"
+            hook_dir.mkdir(parents=True)
+            hook_copy = hook_dir / "agy context hook.py"
+            hook_copy.write_text(HOOK_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "input_tokens": 1200,
+                        "cache_read_tokens": 8800,
+                        "output_tokens": 40,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            cmd = install_mod.build_hook_command(str(py_wrapper), hook_copy)
+            payload = json.dumps({"transcriptPath": str(transcript)}).encode("utf-8")
+            proc = subprocess.run(
+                "cmd.exe /c " + cmd,
+                input=payload,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", errors="replace"))
+            self.assertEqual(proc.stderr.decode("utf-8", errors="replace").strip(), "")
+            parsed = json.loads(proc.stdout.decode("ascii"))
+            self.assertIn("injectSteps", parsed)
+            self.assertIn("10.0k / 1M", parsed["injectSteps"][0]["ephemeralMessage"])
 
 
 if __name__ == "__main__":
