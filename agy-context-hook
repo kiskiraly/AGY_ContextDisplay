@@ -24,16 +24,45 @@ License: MIT
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def configure_stdio() -> None:
+    """
+    Ensure stdin/stdout/stderr use UTF-8 with replacement error handling.
+
+    On Windows, piped subprocess stdio defaults to the legacy ANSI codepage
+    (e.g., cp1252), which raises UnicodeEncodeError/UnicodeDecodeError when
+    reading UTF-8 transcripts/prompts or printing Unicode CLI glyphs.
+    """
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _parse_window_limit() -> int:
+    """Parse AGY_CONTEXT_WINDOW safely, falling back to 1,000,000 tokens."""
+    raw = os.environ.get("AGY_CONTEXT_WINDOW", "").strip()
+    if not raw:
+        return 1_000_000
+    try:
+        val = int(raw)
+        return val if val > 0 else 1_000_000
+    except ValueError:
+        return 1_000_000
+
+
 # Default context window capacity (1,000,000 tokens for Gemini / Argon 1M models).
 # Can be overridden via the AGY_CONTEXT_WINDOW environment variable.
-WINDOW_LIMIT = int(os.environ.get("AGY_CONTEXT_WINDOW", "1000000"))
+WINDOW_LIMIT = _parse_window_limit()
 
 # Approximate characters per token used only for splitting the server-reported
 # total input_tokens across categories (System vs. User vs. Agent vs. Tools).
@@ -360,18 +389,26 @@ def render_cli_panel(metrics: Dict[str, Any], window_limit: int = WINDOW_LIMIT) 
     return "\n".join(lines)
 
 
+def _safe_mtime(path: Path) -> float:
+    """Return file mtime or 0.0 if unavailable (e.g., locked or removed concurrently)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def find_latest_transcript() -> Optional[Path]:
     """Locate the most recently modified Antigravity `transcript.jsonl` across App, CLI, and IDE."""
     gemini_dir = Path.home() / ".gemini"
     candidates: List[Path] = []
     for surface in ("antigravity", "antigravity-cli", "antigravity-ide"):
-        pattern = str(
-            gemini_dir / surface / "brain" / "**" / ".system_generated" / "logs" / "transcript.jsonl"
-        )
-        candidates.extend(Path(p) for p in glob.glob(pattern, recursive=True))
+        brain_dir = gemini_dir / surface / "brain"
+        if not brain_dir.is_dir():
+            continue
+        candidates.extend(brain_dir.glob("**/.system_generated/logs/transcript.jsonl"))
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates, key=_safe_mtime)
 
 
 def is_context_slash_command(steps: List[Dict[str, Any]]) -> bool:
@@ -391,12 +428,13 @@ def is_context_slash_command(steps: List[Dict[str, Any]]) -> bool:
 
 
 def emit(payload: Dict[str, Any]) -> None:
-    """Write a JSON hook response to stdout."""
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    """Write an ASCII-safe JSON hook response to stdout."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
 def main() -> None:
+    configure_stdio()
     parser = argparse.ArgumentParser(
         description="Antigravity CLI-style context window badge hook and terminal inspector."
     )
@@ -424,7 +462,9 @@ def main() -> None:
     # Terminal `/context` panel mode (either explicit `--panel` or interactive TTY without stdin pipe).
     if args.panel or (sys.stdin.isatty() and args.mode == "pre" and len(sys.argv) == 1):
         transcript_path = (
-            Path(args.transcript).expanduser() if args.transcript else find_latest_transcript()
+            Path(args.transcript.strip()).expanduser()
+            if args.transcript.strip()
+            else find_latest_transcript()
         )
         steps = parse_transcript(transcript_path)
         metrics = analyze_context(steps, window_limit=WINDOW_LIMIT)
@@ -442,7 +482,7 @@ def main() -> None:
         emit({})
         return
 
-    transcript_str = args.transcript or hook_input.get("transcriptPath") or ""
+    transcript_str = str(args.transcript or hook_input.get("transcriptPath") or "").strip()
     transcript_path = Path(transcript_str).expanduser() if transcript_str else None
     steps = parse_transcript(transcript_path)
     metrics = analyze_context(steps, window_limit=WINDOW_LIMIT)
